@@ -151,9 +151,23 @@ async def websocket_endpoint(websocket: WebSocket, game_id: str):
             
             # Process the message based on its type
             if data["type"] == "submit_move":
-                pass
-                
-                
+                player_id = data["player_id"]
+                move = data["move"]
+                # Get player seats
+                player_seats = redis.get(f"game:{game_id}:player_seats")
+                if player_seats:
+                    player_seats = json.loads(player_seats)
+                    player_seat = None
+                    for seat, player in player_seats.items():
+                        if player == player_id:
+                            player_seat = seat
+                            break
+                    if player_seat:
+                        print(f"player {player_id} is in seat {player_seat}")
+                    else:
+                        print(f"player {player_id} is not in a seat")
+                    redis.set(f"game:{game_id}:{player_seat}_selection", move)
+                    print(f"player {player_id} made move {move}")                
                 
             elif data["type"] == "join_game":
                 # Handle player joining the game
