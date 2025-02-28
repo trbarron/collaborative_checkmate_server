@@ -1,6 +1,7 @@
 import random
 import time
 import asyncio
+import uuid
 import chess
 import chess.engine
 import os
@@ -314,7 +315,8 @@ class GameManager:
                     {
                         "type": "timer_update",
                         "phase": game_phase,
-                        "seconds_remaining": round(remaining_seconds, 1)
+                        "seconds_remaining": round(remaining_seconds, 1),
+                        "key" : uuid.uuid4().hex
                     },
                     game_id
                 )
