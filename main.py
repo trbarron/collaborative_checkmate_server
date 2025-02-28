@@ -238,17 +238,6 @@ class GameManager:
 
             new_fen = board.fen()
             
-            # Check to see if there is a checkmate
-            is_checkmate = board.is_checkmate()
-            if is_checkmate:
-                await GameManager.update_game_state(
-                    game_id=game_id,
-                    game_phase=GamePhase.COOLDOWN,
-                    next_relevant_time=None
-                )
-                return
-            
-            
             # Update the board state
             await GameManager.update_game_state(
                 game_id=game_id,
@@ -260,6 +249,16 @@ class GameManager:
                 game_id=game_id,
                 **{f"t{team_number}p1_selection": "", f"t{team_number}p2_selection": ""}
             )
+            
+            # Check to see if there is a checkmate
+            is_checkmate = board.is_checkmate()
+            if is_checkmate:
+                await GameManager.update_game_state(
+                    game_id=game_id,
+                    game_phase=GamePhase.COOLDOWN,
+                    next_relevant_time=None
+                )
+                return
             
             # Transition to next phase
             next_phase = GamePhase.TEAM2_SELECTION if team_number == 1 else GamePhase.TEAM1_SELECTION
