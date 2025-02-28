@@ -33,7 +33,7 @@ class GamePhase(str, Enum):
     COOLDOWN = 'cooldown'
 
 # Constants
-SELECTION_TIME = 10  # seconds
+SELECTION_TIME = 15  # seconds
 
 STOCKFISH_PATH = os.getenv("STOCKFISH_PATH", "/usr/games/stockfish")
 engine = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
@@ -121,6 +121,10 @@ class GameManager:
             "t1p2_ready",
             "t2p1_ready",
             "t2p2_ready",
+            # "t1p1_locked_in",
+            # "t1p2_locked_in",
+            # "t2p1_locked_in",
+            # "t2p2_locked_in",
             # "computation_lock",
             "game_phase",
             "next_relevant_time"
@@ -153,7 +157,11 @@ class GameManager:
         await GameManager.update_game_state(
             game_id=game_id,
             game_phase=new_phase,
-            next_relevant_time=str(next_time) if next_time else None
+            next_relevant_time=str(next_time) if next_time else None,
+            t1p1_locked_in = "false",
+            t1p2_locked_in = "false",
+            t2p1_locked_in = "false",
+            t2p2_locked_in = "false"
         )
         
         print(f"Game {game_id} transitioned to {new_phase}")
@@ -239,10 +247,27 @@ class GameManager:
 
             new_fen = board.fen()
             
+            old_board = chess.Board(fen)
+            # Find the last move based on the old fen and new_fen
+            # Loop through all legal moves on the old board
+            for move in old_board.legal_moves:
+                # Create a test board
+                test_board = chess.Board(fen)
+                # Apply the move
+                test_board.push(move)
+                # Check if this results in the same position as our new board
+                if test_board.fen() == new_fen:
+                    last_move = move
+                    break
+            
+            # turn the last move into a comma separated string
+            last_move = str(last_move)
+
             # Update the board state
             await GameManager.update_game_state(
                 game_id=game_id,
-                fen=new_fen
+                fen=new_fen,
+                last_move = last_move
             )
                 
             # Clear selections for this team
@@ -281,7 +306,15 @@ class GameManager:
             game_id=game_id,
             fen=board.fen(),
             game_phase=GamePhase.TEAM1_SELECTION,
-            next_relevant_time=str(time.time() + SELECTION_TIME)
+            next_relevant_time=str(time.time() + SELECTION_TIME),
+        )
+        await manager.broadcast(
+            {
+                "type": "timer_update",
+                "seconds_remaining": round(SELECTION_TIME, 1),
+                "key" : uuid.uuid4().hex
+            },
+            game_id
         )
         
         print(f"Game {game_id} started")
@@ -294,14 +327,43 @@ class GameManager:
         # Get current phase and next relevant time
         game_phase = GameManager.get_game_state(game_id, "game_phase")
         next_time_str = GameManager.get_game_state(game_id, "next_relevant_time")
-        
+        ready_to_compute_early = False
+                
         if not game_phase or not next_time_str:
             return
+        
+        if game_phase == GamePhase.TEAM1_SELECTION:
+            t1p1_locked_in = GameManager.get_game_state(game_id, "t1p1_locked_in") == "true"
+            t1p2_locked_in = GameManager.get_game_state(game_id, "t1p2_locked_in") == "true"
+            t1p1_ready = GameManager.get_game_state(game_id, "t1p1_ready") == "true"
+            t1p2_ready = GameManager.get_game_state(game_id, "t1p2_ready") == "true"
+            if (t1p1_locked_in or not t1p1_ready) and (t1p2_locked_in or not t1p2_ready):
+                ready_to_compute_early = True
+                
+        if game_phase == GamePhase.TEAM2_SELECTION:
+            t2p1_locked_in = GameManager.get_game_state(game_id, "t2p1_locked_in") == "true"
+            t2p2_locked_in = GameManager.get_game_state(game_id, "t2p2_locked_in") == "true"
+            t2p1_ready = GameManager.get_game_state(game_id, "t2p1_ready") == "true"
+            t2p2_ready = GameManager.get_game_state(game_id, "t2p2_ready") == "true"
+            if (t2p1_locked_in or not t2p1_ready) and (t2p2_locked_in or not t2p2_ready):
+                ready_to_compute_early = True
+
+        if ready_to_compute_early:
+            await manager.broadcast(
+                {
+                    "type": "timer_update",
+                    "phase": game_phase,
+                    "seconds_remaining": 0,
+                    "key" : uuid.uuid4().hex
+                },
+                game_id
+            )
             
         current_time = time.time()
         next_time = float(next_time_str)
         
-        if current_time >= next_time and game_phase is not GamePhase.COOLDOWN:
+        if (current_time >= next_time or ready_to_compute_early) \
+            and game_phase is not GamePhase.COOLDOWN:
             # Time's up, transition to the next phase
             if game_phase == GamePhase.TEAM1_SELECTION:
                 await GameManager.transition_phase(game_id, GamePhase.TEAM1_COMPUTING)
@@ -310,7 +372,7 @@ class GameManager:
             
             if game_phase in [GamePhase.TEAM1_SELECTION, GamePhase.TEAM2_SELECTION]:
                 # Broadcast timer updates
-                remaining_seconds = next_time - current_time + SELECTION_TIME
+                remaining_seconds = next_time - current_time
                 await manager.broadcast(
                     {
                         "type": "timer_update",
@@ -340,6 +402,12 @@ def set_up_player_seats(game_id: str, player_id: str):
         pipe.set(f"game:{game_id}:t1p2_ready", "false", ex=86400)
         pipe.set(f"game:{game_id}:t2p1_ready", "false", ex=86400)
         pipe.set(f"game:{game_id}:t2p2_ready", "false", ex=86400)
+        
+        # initialize player locked in with 12 hour ttl
+        pipe.set(f"game:{game_id}:t1p1_locked_in", "false", ex=43200)
+        pipe.set(f"game:{game_id}:t1p2_locked_in", "false", ex=43200)
+        pipe.set(f"game:{game_id}:t2p1_locked_in", "false", ex=43200)
+        pipe.set(f"game:{game_id}:t2p2_locked_in", "false", ex=43200)
         
         # Set initial phase with 24-hour TTL
         pipe.set(f"game:{game_id}:game_phase", GamePhase.SETUP, ex=86400)
@@ -512,6 +580,30 @@ async def websocket_endpoint(websocket: WebSocket, game_id: str, player_id: str)
             
             elif data["type"] == "not_ready":
                 await set_player_ready(game_id, player_id, False)
+
+            elif data["type"] == "lock_in_move":
+                player_id = data["player_id"]
+                
+                # Find player's seat
+                seats = {
+                    "t1p1": redis.get(f"game:{game_id}:t1p1_seat"),
+                    "t1p2": redis.get(f"game:{game_id}:t1p2_seat"),
+                    "t2p1": redis.get(f"game:{game_id}:t2p1_seat"),
+                    "t2p2": redis.get(f"game:{game_id}:t2p2_seat")
+                }
+                
+                player_seat = None
+                for seat, seat_player_id in seats.items():
+                    if seat_player_id == player_id:
+                        player_seat = seat
+                        break
+                
+                print(f"Player {player_id} locked in move in seat {player_seat}")
+                if player_seat:
+                    await GameManager.update_game_state(
+                        game_id=game_id,
+                        **{f"{seat}_locked_in": "true"}
+                    )
 
     except WebSocketDisconnect:
         # Handle disconnect
