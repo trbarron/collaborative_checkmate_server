@@ -197,6 +197,17 @@ class PhaseManager:
         if new_phase in [GamePhase.TEAM1_SELECTION, GamePhase.TEAM2_SELECTION]:
             # Set selection phase timeout
             next_time = current_time + GameConfig.SELECTION_TIME
+            
+            # Immediately broadcast the correct initial timer
+            await manager.broadcast(
+                {
+                    "type": "timer_update",
+                    "phase": new_phase,
+                    "seconds_remaining": GameConfig.SELECTION_TIME,
+                    "key": uuid.uuid4().hex
+                },
+                game_id
+            )
         
         # Update game state with new phase and next relevant time
         await GameStateManager.update_game_state(
@@ -225,52 +236,69 @@ class PhaseManager:
         # Get current phase and next relevant time
         game_phase = GameStateManager.get_game_state(game_id, "game_phase")
         next_time_str = GameStateManager.get_game_state(game_id, "next_relevant_time")
-        ready_to_compute_early = False
-                
+        
+        # If we're in an invalid state, exit early
         if not game_phase or not next_time_str:
             return
         
-        # Check if all team members have locked in their selections
+        # If we're in a non-selection phase, we don't need to check for transitions
+        if game_phase not in [GamePhase.TEAM1_SELECTION, GamePhase.TEAM2_SELECTION]:
+            return
+        
+        # Calculate if we should transition based on team readiness
+        ready_to_compute_early = False
         if game_phase == GamePhase.TEAM1_SELECTION:
             ready_to_compute_early = PhaseManager._check_team_ready(game_id, 1)
-                
-        if game_phase == GamePhase.TEAM2_SELECTION:
+        elif game_phase == GamePhase.TEAM2_SELECTION:
             ready_to_compute_early = PhaseManager._check_team_ready(game_id, 2)
-
-        if ready_to_compute_early:
-            await manager.broadcast(
-                {
-                    "type": "timer_update",
-                    "phase": game_phase,
-                    "seconds_remaining": 0,
-                    "key": uuid.uuid4().hex
-                },
-                game_id
-            )
-            
+        
+        # Calculate if we should transition based on time
         current_time = time.time()
         next_time = float(next_time_str)
+        time_expired = current_time >= next_time
         
-        if (current_time >= next_time or ready_to_compute_early) \
-            and game_phase != GamePhase.COOLDOWN:
-            # Time's up, transition to the next phase
-            if game_phase == GamePhase.TEAM1_SELECTION:
-                await PhaseManager.transition_phase(game_id, GamePhase.TEAM1_COMPUTING)
-            elif game_phase == GamePhase.TEAM2_SELECTION:
-                await PhaseManager.transition_phase(game_id, GamePhase.TEAM2_COMPUTING)
-            
-            if game_phase in [GamePhase.TEAM1_SELECTION, GamePhase.TEAM2_SELECTION]:
-                # Broadcast timer updates
-                remaining_seconds = next_time - current_time
+        # Determine if we need to transition
+        should_transition = ready_to_compute_early or time_expired
+        
+        if should_transition:
+            # Create a lock to prevent multiple transitions
+            lock_key = f"game:{game_id}:transition_lock"
+            if not RedisHelper.set_if_not_exists(lock_key, "1", ttl=5):  # 5-second TTL
+                # Another process is already handling the transition
+                return
+                
+            try:
+                # Ensure we're still in the same phase (double-check)
+                current_phase = GameStateManager.get_game_state(game_id, "game_phase")
+                if current_phase != game_phase:
+                    return
+                
+                # Send a single timer update with 0 seconds
                 await manager.broadcast(
                     {
                         "type": "timer_update",
                         "phase": game_phase,
-                        "seconds_remaining": round(remaining_seconds, 1),
+                        "seconds_remaining": 0,
                         "key": uuid.uuid4().hex
                     },
                     game_id
                 )
+                
+                # Small delay to ensure the timer update is processed
+                await asyncio.sleep(0.1)
+                
+                # Determine the next phase
+                next_phase = None
+                if game_phase == GamePhase.TEAM1_SELECTION:
+                    next_phase = GamePhase.TEAM1_COMPUTING
+                elif game_phase == GamePhase.TEAM2_SELECTION:
+                    next_phase = GamePhase.TEAM2_COMPUTING
+                
+                if next_phase:
+                    await PhaseManager.transition_phase(game_id, next_phase)
+            finally:
+                # Always release the lock
+                RedisHelper.delete(lock_key)
                 
     @staticmethod
     def _check_team_ready(game_id: str, team_number: int) -> bool:
