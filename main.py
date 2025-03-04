@@ -6,20 +6,36 @@ import chess
 import chess.engine
 import os
 from typing import Dict, Optional, List, Any, Tuple
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from redis import Redis
 from dotenv import load_dotenv
 from enum import Enum
 
-# Load environment variables
 load_dotenv()
 
-# Initialize FastAPI app
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:8000",
+        "http://localhost:8811",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:8000",
+        "http://127.0.0.1:8811",
+        "https://tylerbarron.com",
+        "https://www.tylerbarron.com"
+    ],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
+)
 
 # Game configuration
 class GameConfig:
-    # Time settings
     SELECTION_TIME = 15  # seconds in selection phase
     
     # Redis connection settings
@@ -28,14 +44,11 @@ class GameConfig:
     REDIS_DB = 0
     REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
     
-    # Redis TTL values (in seconds)
     REDIS_SHORT_TTL = 43200  # 12 hours
     REDIS_LONG_TTL = 86400   # 24 hours
     
-    # Stockfish path
     STOCKFISH_PATH = os.getenv("STOCKFISH_PATH", "/usr/games/stockfish")
     
-    # Stockfish analysis time
     STOCKFISH_ANALYSIS_TIME = 2.0  # seconds
 
 # Game phases
@@ -183,7 +196,6 @@ class GameStateManager:
         redis_keys = [RedisHelper.game_key(game_id, key) for key in known_keys]
         values = RedisHelper.get_multiple(redis_keys)
         
-        # Combine keys and values into a dictionary
         return dict(zip(known_keys, values))
 
 # Game phase management
@@ -297,7 +309,6 @@ class PhaseManager:
                 if next_phase:
                     await PhaseManager.transition_phase(game_id, next_phase)
             finally:
-                # Always release the lock
                 RedisHelper.delete(lock_key)
                 
     @staticmethod
@@ -374,7 +385,6 @@ class MoveCalculator:
             await PhaseManager.transition_phase(game_id, next_phase)
                 
         finally:
-            # Release the computation lock
             RedisHelper.delete(lock_key)
     
     @staticmethod
@@ -418,28 +428,27 @@ class MoveCalculator:
         old_board = chess.Board(old_fen)
         # Loop through all legal moves on the old board
         for move in old_board.legal_moves:
-            # Create a test board
             test_board = chess.Board(old_fen)
-            # Apply the move
             test_board.push(move)
             # Check if this results in the same position as our new board
             if test_board.fen() == new_fen:
                 return str(move)
-        return ""  # Fallback if move can't be determined
+        return ""
 
 # Game initialization and management
 class GameManager:
     @staticmethod
-    async def start_game(game_id: str):
+    async def start_game(game_id: str, is_private: bool = False):
         """Initialize a new game"""
         board = chess.Board()
         
-        # Set initial game state
         await GameStateManager.update_game_state(
             game_id=game_id,
             fen=board.fen(),
             game_phase=GamePhase.TEAM1_SELECTION,
             next_relevant_time=str(time.time() + GameConfig.SELECTION_TIME),
+            created_time=str(time.time()),
+            is_private="true" if is_private else "false"
         )
         
         await manager.broadcast(
@@ -451,7 +460,7 @@ class GameManager:
             game_id
         )
         
-        print(f"Game {game_id} started")
+        print(f"Game {game_id} started (Private: {is_private})")
     
     @staticmethod
     def initialize_player_seats(game_id: str, player_id: str):
@@ -643,10 +652,26 @@ class PlayerActionHandler:
 
 # WebSocket endpoint
 @app.websocket("/ws/game/{game_id}/player/{player_id}")
-async def websocket_endpoint(websocket: WebSocket, game_id: str, player_id: str):
+async def websocket_endpoint(
+    websocket: WebSocket, 
+    game_id: str, 
+    player_id: str, 
+    is_private: bool = Query(False)
+):
     # Accept connection and set up player
     await manager.connect(websocket, game_id, player_id)
     GameManager.initialize_player_seats(game_id, player_id)
+    
+    game_exists = redis.exists(RedisHelper.game_key(game_id, "created_time"))
+    if not game_exists:
+        RedisHelper.set_with_ttl(
+            RedisHelper.game_key(game_id, "is_private"),
+            "true" if is_private else "false"
+        )
+        RedisHelper.set_with_ttl(
+            RedisHelper.game_key(game_id, "created_time"),
+            str(time.time())
+        )
     
     # Send initial connection confirmation
     await manager.send_personal_message(
@@ -720,7 +745,74 @@ async def game_state_checker(game_id: str):
         print(f"Game state checker for game {game_id} was cancelled")
     except Exception as e:
         print(f"Error in game state checker for game {game_id}: {e}")
-
+@app.get("/api/games/available")
+async def get_available_games():
+    """Return a list of available games that can be joined"""
+    try:
+        # Get all game keys from Redis
+        all_game_keys = redis.keys("game:*:game_phase")
+        
+        game_ids = set()
+        
+        # Extract unique game IDs
+        for key in all_game_keys:
+            parts = key.split(":")
+            if len(parts) >= 2:
+                game_ids.add(parts[1])
+                
+        available_games = []
+        current_time = time.time()
+        
+        # Check each game for availability
+        for game_id in game_ids:
+            game_phase = RedisHelper.get(RedisHelper.game_key(game_id, "game_phase"))
+            created_time = RedisHelper.get(RedisHelper.game_key(game_id, "created_time"))
+            is_private = RedisHelper.get(RedisHelper.game_key(game_id, "is_private"))
+            
+            # Skip games with missing critical data
+            if None in [game_phase, created_time]:
+                continue
+                        
+            # Get player seats
+            t1p1_seat = RedisHelper.get(RedisHelper.game_key(game_id, "t1p1_seat")) or ""
+            t1p2_seat = RedisHelper.get(RedisHelper.game_key(game_id, "t1p2_seat")) or ""
+            t2p1_seat = RedisHelper.get(RedisHelper.game_key(game_id, "t2p1_seat")) or ""
+            t2p2_seat = RedisHelper.get(RedisHelper.game_key(game_id, "t2p2_seat")) or ""
+                        
+            # Convert created_time to float
+            created_time_float = float(created_time)
+            
+            # Check if game is available
+            is_recent = (current_time - created_time_float) < 1200
+            is_setup = game_phase == GamePhase.SETUP 
+            is_private_game = is_private == "true"
+            has_open_seats = not all([t1p1_seat, t1p2_seat, t2p1_seat, t2p2_seat])
+                        
+            # For debugging: print time difference
+            time_diff_minutes = (current_time - created_time_float) / 60
+            
+            if is_recent and is_setup and not is_private_game and has_open_seats:
+                # Count occupied seats
+                occupied_seat_count = sum(1 for seat in [t1p1_seat, t1p2_seat, t2p1_seat, t2p2_seat] if seat)
+                
+                available_games.append({
+                    "game_id": game_id,
+                    "created_time": created_time_float,
+                    "occupied_seats": occupied_seat_count,
+                    "phase": game_phase
+                })
+                
+        # Sort games by creation time (newest first)
+        available_games.sort(key=lambda g: g["created_time"], reverse=True)
+        
+        return JSONResponse(content={"games": available_games})
+    
+    except Exception as e:
+        print(f"Error getting available games: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+    
 # Run the app with uvicorn
 if __name__ == "__main__":
     import uvicorn
