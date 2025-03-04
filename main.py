@@ -568,7 +568,7 @@ class PlayerActionHandler:
                         all_ready = False
             
             # Start game if all players are ready and we have at least two players
-            if all_ready and occupied_seats >= 2:
+            if all_ready and occupied_seats >= 4:
                 current_phase = GameStateManager.get_game_state(game_id, "game_phase")
                 if current_phase == GamePhase.SETUP:
                     await GameManager.start_game(game_id)
