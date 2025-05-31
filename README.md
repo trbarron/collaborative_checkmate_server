@@ -73,8 +73,10 @@ The server can log detailed game statistics to Supabase:
 ### What Gets Logged
 
 - **Game Start**: Player names, lobby info, timestamp
-- **During Game**: Move count tracking
-- **Game End**: Final statistics, winner, game result (checkmate/stalemate/draw)
+- **During Game**: Move count tracking, team collaboration statistics
+- **Game End**: Final statistics, winner, game result (checkmate/stalemate/draw), same-move counts
+
+The server tracks when both players on a team submit identical moves
 
 ### View Statistics
 

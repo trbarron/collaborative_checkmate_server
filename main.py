@@ -141,7 +141,7 @@ class GameLogger:
             print(f"Error logging game start for {game_id}: {e}")
     
     @staticmethod
-    async def log_game_end(game_id: str, game_result: str, winner: str = None):
+    async def log_game_end(game_id: str, game_result: str, winner: str = None, move_count: int = 0, t1_same_moves: int = 0, t2_same_moves: int = 0):
         """Log when a game ends with final statistics"""
         supabase = get_supabase_client()
         if not supabase:
@@ -151,15 +151,17 @@ class GameLogger:
         try:
             # Get current move count from database
             current_log = supabase.table("game_logs").select("move_count").eq("game_id", game_id).execute()
-            move_count = 0
+            current_count = 0
             if current_log.data:
-                move_count = current_log.data[0].get("move_count", 0)
+                current_count = current_log.data[0].get("move_count", 0)
             
             update_data = {
                 "ended_at": datetime.utcnow().isoformat(),
-                "move_count": move_count,
+                "move_count": current_count,
                 "game_result": game_result,
-                "game_status": "completed"
+                "game_status": "completed",
+                "t1_same_moves": t1_same_moves,
+                "t2_same_moves": t2_same_moves
             }
             
             if winner:
@@ -200,17 +202,18 @@ class GameLogger:
             return
             
         try:
-            # Get current move count from database
-            current_log = supabase.table("game_logs").select("move_count").eq("game_id", game_id).execute()
-            move_count = 0
-            if current_log.data:
-                move_count = current_log.data[0].get("move_count", 0)
+            # Get current stats from Redis
+            move_count = int(GameStateManager.get_game_state(game_id, "move_count") or "0")
+            t1_same_moves = int(GameStateManager.get_game_state(game_id, "t1_same_moves") or "0")
+            t2_same_moves = int(GameStateManager.get_game_state(game_id, "t2_same_moves") or "0")
             
             update_data = {
                 "ended_at": datetime.utcnow().isoformat(),
                 "move_count": move_count,
                 "game_result": "abandoned",
-                "game_status": "abandoned"
+                "game_status": "abandoned",
+                "t1_same_moves": t1_same_moves,
+                "t2_same_moves": t2_same_moves
             }
             
             result = supabase.table("game_logs").update(update_data).eq("game_id", game_id).execute()
@@ -337,7 +340,10 @@ class GameStateManager:
             "t2p1_ready",
             "t2p2_ready",
             "game_phase",
-            "next_relevant_time"
+            "next_relevant_time",
+            "move_count",
+            "t1_same_moves",
+            "t2_same_moves"
         ]
         
         redis_keys = [RedisHelper.game_key(game_id, key) for key in known_keys]
@@ -518,14 +524,32 @@ class MoveCalculator:
                 **{f"t{team_number}p1_selection": "", f"t{team_number}p2_selection": ""}
             )
             
-            # Increment move count in Supabase
-            await GameLogger.increment_move_count(game_id)
+            # Increment local move count (will sync to Supabase at game end)
+            current_moves = int(GameStateManager.get_game_state(game_id, "move_count") or "0")
+            await GameStateManager.update_game_state(
+                game_id=game_id,
+                move_count=str(current_moves + 1)
+            )
+            
+            # Check if both players submitted the same move (for logging)
+            both_same_move = p1_selection and p2_selection and p1_selection == p2_selection
+            if both_same_move:
+                current_same_moves = GameStateManager.get_game_state(game_id, f"t{team_number}_same_moves") or "0"
+                await GameStateManager.update_game_state(
+                    game_id=game_id,
+                    **{f"t{team_number}_same_moves": str(int(current_same_moves) + 1)}
+                )
             
             # Check if game is over
             if board.is_checkmate():
+                # Get final move count and same-move stats
+                final_move_count = int(GameStateManager.get_game_state(game_id, "move_count") or "0")
+                t1_same_moves = int(GameStateManager.get_game_state(game_id, "t1_same_moves") or "0")
+                t2_same_moves = int(GameStateManager.get_game_state(game_id, "t2_same_moves") or "0")
+                
                 # Determine winner and log game end
                 winner = "Team 1" if board.turn == chess.BLACK else "Team 2"  # Opposite of current turn
-                await GameLogger.log_game_end(game_id, "checkmate", winner)
+                await GameLogger.log_game_end(game_id, "checkmate", winner, final_move_count, t1_same_moves, t2_same_moves)
                 
                 await GameStateManager.update_game_state(
                     game_id=game_id,
@@ -536,7 +560,11 @@ class MoveCalculator:
             
             # Check for stalemate
             if board.is_stalemate():
-                await GameLogger.log_game_end(game_id, "stalemate")
+                final_move_count = int(GameStateManager.get_game_state(game_id, "move_count") or "0")
+                t1_same_moves = int(GameStateManager.get_game_state(game_id, "t1_same_moves") or "0")
+                t2_same_moves = int(GameStateManager.get_game_state(game_id, "t2_same_moves") or "0")
+                
+                await GameLogger.log_game_end(game_id, "stalemate", None, final_move_count, t1_same_moves, t2_same_moves)
                 
                 await GameStateManager.update_game_state(
                     game_id=game_id,
@@ -547,7 +575,11 @@ class MoveCalculator:
             
             # Check for draw by other means
             if board.is_insufficient_material() or board.is_seventyfive_moves() or board.is_fivefold_repetition():
-                await GameLogger.log_game_end(game_id, "draw")
+                final_move_count = int(GameStateManager.get_game_state(game_id, "move_count") or "0")
+                t1_same_moves = int(GameStateManager.get_game_state(game_id, "t1_same_moves") or "0")
+                t2_same_moves = int(GameStateManager.get_game_state(game_id, "t2_same_moves") or "0")
+                
+                await GameLogger.log_game_end(game_id, "draw", None, final_move_count, t1_same_moves, t2_same_moves)
                 
                 await GameStateManager.update_game_state(
                     game_id=game_id,
@@ -668,6 +700,11 @@ class GameManager:
             
             # Set initial phase
             key_values[RedisHelper.game_key(game_id, "game_phase")] = GamePhase.SETUP
+            
+            # Initialize move tracking
+            key_values[RedisHelper.game_key(game_id, "move_count")] = "0"
+            key_values[RedisHelper.game_key(game_id, "t1_same_moves")] = "0"
+            key_values[RedisHelper.game_key(game_id, "t2_same_moves")] = "0"
             
             # Set player in first seat
             key_values[t1p1_seat_key] = player_id

@@ -12,6 +12,8 @@ CREATE TABLE IF NOT EXISTS game_logs (
     team2_player1 VARCHAR(255),
     team2_player2 VARCHAR(255),
     move_count INTEGER DEFAULT 0,
+    t1_same_moves INTEGER DEFAULT 0, -- Number of times both Team 1 players submitted the same move
+    t2_same_moves INTEGER DEFAULT 0, -- Number of times both Team 2 players submitted the same move
     game_result VARCHAR(50), -- 'checkmate', 'stalemate', 'draw', 'abandoned'
     winner VARCHAR(50), -- 'Team 1', 'Team 2', null for draws/stalemates
     game_status VARCHAR(20) DEFAULT 'in_progress', -- 'in_progress', 'completed', 'abandoned'
@@ -47,4 +49,8 @@ $$ language 'plpgsql';
 CREATE TRIGGER update_game_logs_updated_at 
     BEFORE UPDATE ON game_logs 
     FOR EACH ROW 
-    EXECUTE FUNCTION update_updated_at_column(); 
+    EXECUTE FUNCTION update_updated_at_column();
+
+-- If you already have the table, add the new columns:
+-- ALTER TABLE game_logs ADD COLUMN IF NOT EXISTS t1_same_moves INTEGER DEFAULT 0;
+-- ALTER TABLE game_logs ADD COLUMN IF NOT EXISTS t2_same_moves INTEGER DEFAULT 0; 
