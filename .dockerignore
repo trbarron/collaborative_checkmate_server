@@ -1,8 +1,24 @@
+# Environment variables and secrets
 .env
+.env.*
+
+# Git and version control
 .git
 .gitignore
+
+# Virtual environments
 .venv
 venv
+
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
+
+# Documentation and development files
+*.md
+supabase_schema.sql
+env.example
+
+# macOS
+.DS_Store

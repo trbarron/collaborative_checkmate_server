@@ -12,6 +12,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from redis import Redis
 from dotenv import load_dotenv
 from enum import Enum
+from supabase import create_client, Client
+import traceback
 
 load_dotenv()
 
@@ -50,6 +52,10 @@ class GameConfig:
     STOCKFISH_PATH = os.getenv("STOCKFISH_PATH", "/usr/games/stockfish")
     
     STOCKFISH_ANALYSIS_TIME = 2.0  # seconds
+    
+    # Supabase configuration
+    SUPABASE_URL = os.getenv("SUPABASE_URL")
+    SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY")
 
 # Game phases
 class GamePhase(str, Enum):
@@ -71,6 +77,124 @@ redis = Redis(
 
 # Initialize chess engine
 engine = chess.engine.SimpleEngine.popen_uci(GameConfig.STOCKFISH_PATH)
+
+# Initialize Supabase client
+supabase: Client = None
+if GameConfig.SUPABASE_URL and GameConfig.SUPABASE_KEY:
+    supabase = create_client(GameConfig.SUPABASE_URL, GameConfig.SUPABASE_KEY)
+    print("Supabase client initialized successfully")
+else:
+    print("Warning: Supabase credentials not found, game logging will be disabled")
+
+# Game logging to Supabase
+class GameLogger:
+    @staticmethod
+    async def log_game_start(game_id: str, player_names: Dict[str, str]):
+        """Log when a game starts with initial player information"""
+        if not supabase:
+            print("Supabase not available, skipping game start log")
+            return
+            
+        try:
+            # Get player names for each seat
+            team1_player1 = player_names.get("t1p1", "Unknown")
+            team1_player2 = player_names.get("t1p2", "Unknown") 
+            team2_player1 = player_names.get("t2p1", "Unknown")
+            team2_player2 = player_names.get("t2p2", "Unknown")
+            
+            game_log = {
+                "game_id": game_id,
+                "lobby_name": game_id,
+                "started_at": time.time(),
+                "team1_player1": team1_player1,
+                "team1_player2": team1_player2,
+                "team2_player1": team2_player1,
+                "team2_player2": team2_player2,
+                "move_count": 0,
+                "game_status": "in_progress"
+            }
+            
+            result = supabase.table("game_logs").insert(game_log).execute()
+            print(f"Game start logged for {game_id}: {result}")
+            
+        except Exception as e:
+            print(f"Error logging game start for {game_id}: {e}")
+    
+    @staticmethod
+    async def log_game_end(game_id: str, game_result: str, winner: str = None):
+        """Log when a game ends with final statistics"""
+        if not supabase:
+            print("Supabase not available, skipping game end log")
+            return
+            
+        try:
+            # Get current move count from database
+            current_log = supabase.table("game_logs").select("move_count").eq("game_id", game_id).execute()
+            move_count = 0
+            if current_log.data:
+                move_count = current_log.data[0].get("move_count", 0)
+            
+            update_data = {
+                "ended_at": time.time(),
+                "move_count": move_count,
+                "game_result": game_result,
+                "game_status": "completed"
+            }
+            
+            if winner:
+                update_data["winner"] = winner
+            
+            result = supabase.table("game_logs").update(update_data).eq("game_id", game_id).execute()
+            print(f"Game end logged for {game_id}: {result}")
+            
+        except Exception as e:
+            print(f"Error logging game end for {game_id}: {e}")
+    
+    @staticmethod
+    async def increment_move_count(game_id: str):
+        """Increment the move count for a game"""
+        if not supabase:
+            return
+            
+        try:
+            # Get current move count
+            current_log = supabase.table("game_logs").select("move_count").eq("game_id", game_id).execute()
+            
+            if current_log.data:
+                current_count = current_log.data[0].get("move_count", 0)
+                new_count = current_count + 1
+                
+                supabase.table("game_logs").update({"move_count": new_count}).eq("game_id", game_id).execute()
+                print(f"Move count updated for {game_id}: {new_count}")
+                
+        except Exception as e:
+            print(f"Error updating move count for {game_id}: {e}")
+    
+    @staticmethod
+    async def log_game_abandoned(game_id: str):
+        """Log when a game is abandoned due to player disconnections"""
+        if not supabase:
+            return
+            
+        try:
+            # Get current move count from database
+            current_log = supabase.table("game_logs").select("move_count").eq("game_id", game_id).execute()
+            move_count = 0
+            if current_log.data:
+                move_count = current_log.data[0].get("move_count", 0)
+            
+            update_data = {
+                "ended_at": time.time(),
+                "move_count": move_count,
+                "game_result": "abandoned",
+                "game_status": "abandoned"
+            }
+            
+            result = supabase.table("game_logs").update(update_data).eq("game_id", game_id).execute()
+            print(f"Game abandonment logged for {game_id}: {result}")
+            
+        except Exception as e:
+            print(f"Error logging game abandonment for {game_id}: {e}")
 
 # WebSocket connection manager
 class ConnectionManager:
@@ -371,8 +495,37 @@ class MoveCalculator:
                 **{f"t{team_number}p1_selection": "", f"t{team_number}p2_selection": ""}
             )
             
+            # Increment move count in Supabase
+            await GameLogger.increment_move_count(game_id)
+            
             # Check if game is over
             if board.is_checkmate():
+                # Determine winner and log game end
+                winner = "Team 1" if board.turn == chess.BLACK else "Team 2"  # Opposite of current turn
+                await GameLogger.log_game_end(game_id, "checkmate", winner)
+                
+                await GameStateManager.update_game_state(
+                    game_id=game_id,
+                    game_phase=GamePhase.COOLDOWN,
+                    next_relevant_time=None
+                )
+                return
+            
+            # Check for stalemate
+            if board.is_stalemate():
+                await GameLogger.log_game_end(game_id, "stalemate")
+                
+                await GameStateManager.update_game_state(
+                    game_id=game_id,
+                    game_phase=GamePhase.COOLDOWN,
+                    next_relevant_time=None
+                )
+                return
+            
+            # Check for draw by other means
+            if board.is_insufficient_material() or board.is_seventyfive_moves() or board.is_fivefold_repetition():
+                await GameLogger.log_game_end(game_id, "draw")
+                
                 await GameStateManager.update_game_state(
                     game_id=game_id,
                     game_phase=GamePhase.COOLDOWN,
@@ -459,6 +612,11 @@ class GameManager:
             },
             game_id
         )
+        
+        # Log game start to Supabase
+        seats = GameManager.get_all_seats(game_id)
+        player_names = {seat: player_id for seat, player_id in seats.items() if player_id}
+        await GameLogger.log_game_start(game_id, player_names)
         
         print(f"Game {game_id} started (Private: {is_private})")
     
@@ -745,6 +903,7 @@ async def game_state_checker(game_id: str):
         print(f"Game state checker for game {game_id} was cancelled")
     except Exception as e:
         print(f"Error in game state checker for game {game_id}: {e}")
+
 @app.get("/api/games/available")
 async def get_available_games():
     """Return a list of available games that can be joined"""
@@ -759,7 +918,7 @@ async def get_available_games():
             parts = key.split(":")
             if len(parts) >= 2:
                 game_ids.add(parts[1])
-                
+        
         available_games = []
         current_time = time.time()
         
@@ -772,7 +931,7 @@ async def get_available_games():
             # Skip games with missing critical data
             if None in [game_phase, created_time]:
                 continue
-                        
+            
             # Get player seats
             t1p1_seat = RedisHelper.get(RedisHelper.game_key(game_id, "t1p1_seat")) or ""
             t1p2_seat = RedisHelper.get(RedisHelper.game_key(game_id, "t1p2_seat")) or ""
@@ -787,7 +946,7 @@ async def get_available_games():
             is_setup = game_phase == GamePhase.SETUP 
             is_private_game = is_private == "true"
             has_open_seats = not all([t1p1_seat, t1p2_seat, t2p1_seat, t2p2_seat])
-                        
+            
             # For debugging: print time difference
             time_diff_minutes = (current_time - created_time_float) / 60
             
@@ -801,7 +960,7 @@ async def get_available_games():
                     "occupied_seats": occupied_seat_count,
                     "phase": game_phase
                 })
-                
+        
         # Sort games by creation time (newest first)
         available_games.sort(key=lambda g: g["created_time"], reverse=True)
         
@@ -809,10 +968,64 @@ async def get_available_games():
     
     except Exception as e:
         print(f"Error getting available games: {e}")
-        import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/games/stats")
+async def get_game_stats():
+    """Return game statistics from Supabase"""
+    if not supabase:
+        return JSONResponse(content={"error": "Game logging not configured"}, status_code=503)
     
+    try:
+        # Get basic stats
+        all_games = supabase.table("game_logs").select("*").execute()
+        
+        if not all_games.data:
+            return JSONResponse(content={
+                "total_games": 0,
+                "completed_games": 0,
+                "in_progress_games": 0,
+                "abandoned_games": 0,
+                "average_moves": 0,
+                "win_stats": {},
+                "recent_games": []
+            })
+        
+        games = all_games.data
+        total_games = len(games)
+        completed_games = len([g for g in games if g["game_status"] == "completed"])
+        in_progress_games = len([g for g in games if g["game_status"] == "in_progress"])
+        abandoned_games = len([g for g in games if g["game_status"] == "abandoned"])
+        
+        # Calculate average moves for completed games
+        completed_with_moves = [g for g in games if g["game_status"] == "completed" and g["move_count"]]
+        average_moves = sum(g["move_count"] for g in completed_with_moves) / len(completed_with_moves) if completed_with_moves else 0
+        
+        # Win statistics
+        win_stats = {}
+        for game in games:
+            if game["game_status"] == "completed" and game["winner"]:
+                winner = game["winner"]
+                win_stats[winner] = win_stats.get(winner, 0) + 1
+        
+        # Recent games (last 10)
+        recent_games = sorted(games, key=lambda x: x["started_at"], reverse=True)[:10]
+        
+        return JSONResponse(content={
+            "total_games": total_games,
+            "completed_games": completed_games,
+            "in_progress_games": in_progress_games,
+            "abandoned_games": abandoned_games,
+            "average_moves": round(average_moves, 1),
+            "win_stats": win_stats,
+            "recent_games": recent_games
+        })
+    
+    except Exception as e:
+        print(f"Error getting game stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # Run the app with uvicorn
 if __name__ == "__main__":
     import uvicorn
