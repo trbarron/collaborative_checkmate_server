@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from enum import Enum
 from supabase import create_client, Client
 import traceback
+from datetime import datetime
 
 load_dotenv()
 
@@ -78,19 +79,38 @@ redis = Redis(
 # Initialize chess engine
 engine = chess.engine.SimpleEngine.popen_uci(GameConfig.STOCKFISH_PATH)
 
-# Initialize Supabase client
+# Initialize Supabase client lazily
 supabase: Client = None
-if GameConfig.SUPABASE_URL and GameConfig.SUPABASE_KEY:
-    supabase = create_client(GameConfig.SUPABASE_URL, GameConfig.SUPABASE_KEY)
-    print("Supabase client initialized successfully")
-else:
-    print("Warning: Supabase credentials not found, game logging will be disabled")
+supabase_init_attempted = False
+
+def get_supabase_client():
+    """Get Supabase client with lazy initialization"""
+    global supabase, supabase_init_attempted
+    
+    if supabase_init_attempted:
+        return supabase
+        
+    supabase_init_attempted = True
+    
+    if not GameConfig.SUPABASE_URL or not GameConfig.SUPABASE_KEY:
+        print("Warning: Supabase credentials not found, game logging will be disabled")
+        return None
+        
+    try:
+        supabase = create_client(GameConfig.SUPABASE_URL, GameConfig.SUPABASE_KEY)
+        print("Supabase client initialized successfully")
+        return supabase
+    except Exception as e:
+        print(f"Warning: Failed to initialize Supabase client: {e}")
+        print("Game logging will be disabled, but the server will continue to function")
+        return None
 
 # Game logging to Supabase
 class GameLogger:
     @staticmethod
     async def log_game_start(game_id: str, player_names: Dict[str, str]):
         """Log when a game starts with initial player information"""
+        supabase = get_supabase_client()
         if not supabase:
             print("Supabase not available, skipping game start log")
             return
@@ -105,7 +125,7 @@ class GameLogger:
             game_log = {
                 "game_id": game_id,
                 "lobby_name": game_id,
-                "started_at": time.time(),
+                "started_at": datetime.utcnow().isoformat(),
                 "team1_player1": team1_player1,
                 "team1_player2": team1_player2,
                 "team2_player1": team2_player1,
@@ -123,6 +143,7 @@ class GameLogger:
     @staticmethod
     async def log_game_end(game_id: str, game_result: str, winner: str = None):
         """Log when a game ends with final statistics"""
+        supabase = get_supabase_client()
         if not supabase:
             print("Supabase not available, skipping game end log")
             return
@@ -135,7 +156,7 @@ class GameLogger:
                 move_count = current_log.data[0].get("move_count", 0)
             
             update_data = {
-                "ended_at": time.time(),
+                "ended_at": datetime.utcnow().isoformat(),
                 "move_count": move_count,
                 "game_result": game_result,
                 "game_status": "completed"
@@ -153,6 +174,7 @@ class GameLogger:
     @staticmethod
     async def increment_move_count(game_id: str):
         """Increment the move count for a game"""
+        supabase = get_supabase_client()
         if not supabase:
             return
             
@@ -173,6 +195,7 @@ class GameLogger:
     @staticmethod
     async def log_game_abandoned(game_id: str):
         """Log when a game is abandoned due to player disconnections"""
+        supabase = get_supabase_client()
         if not supabase:
             return
             
@@ -184,7 +207,7 @@ class GameLogger:
                 move_count = current_log.data[0].get("move_count", 0)
             
             update_data = {
-                "ended_at": time.time(),
+                "ended_at": datetime.utcnow().isoformat(),
                 "move_count": move_count,
                 "game_result": "abandoned",
                 "game_status": "abandoned"
@@ -974,6 +997,7 @@ async def get_available_games():
 @app.get("/api/games/stats")
 async def get_game_stats():
     """Return game statistics from Supabase"""
+    supabase = get_supabase_client()
     if not supabase:
         return JSONResponse(content={"error": "Game logging not configured"}, status_code=503)
     

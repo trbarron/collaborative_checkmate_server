@@ -4,4 +4,4 @@ websockets==11.0.3
 python-chess==1.999
 redis==5.0.1
 python-dotenv==1.0.0
-supabase==2.3.4
+supabase==2.7.4
