@@ -16,6 +16,9 @@ from supabase import create_client, Client
 import traceback
 from datetime import datetime
 
+# Import Pydantic validation
+from message_validator import ValidatedConnectionManager, process_validated_message
+
 load_dotenv()
 
 app = FastAPI()
@@ -53,6 +56,10 @@ class GameConfig:
     STOCKFISH_PATH = os.getenv("STOCKFISH_PATH", "/usr/games/stockfish")
     
     STOCKFISH_ANALYSIS_TIME = 2.0  # seconds
+    
+    # Reconnection settings
+    RECONNECTION_GRACE_PERIOD = 30  # seconds to allow reconnection
+    DISCONNECT_CLEANUP_DELAY = 5    # seconds before marking as disconnected
     
     # Supabase configuration
     SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -226,6 +233,7 @@ class GameLogger:
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, Dict[str, WebSocket]] = {}
+        self.disconnection_times: Dict[str, Dict[str, float]] = {}  # Track when players disconnect
 
     async def connect(self, websocket: WebSocket, game_id: str, player_id: str):
         """Accept a new WebSocket connection and store it"""
@@ -233,28 +241,80 @@ class ConnectionManager:
         if game_id not in self.active_connections:
             self.active_connections[game_id] = {}
         self.active_connections[game_id][player_id] = websocket
+        
+        # Clear disconnection time if player is reconnecting
+        if game_id in self.disconnection_times and player_id in self.disconnection_times[game_id]:
+            del self.disconnection_times[game_id][player_id]
+            print(f"Player {player_id} reconnected to game {game_id}")
 
     def disconnect(self, game_id: str, player_id: str):
-        """Remove a WebSocket connection"""
+        """Remove a WebSocket connection and track disconnection time"""
         if game_id in self.active_connections:
             if player_id in self.active_connections[game_id]:
                 del self.active_connections[game_id][player_id]
             if not self.active_connections[game_id]:
                 del self.active_connections[game_id]
+        
+        # Track disconnection time for grace period
+        if game_id not in self.disconnection_times:
+            self.disconnection_times[game_id] = {}
+        self.disconnection_times[game_id][player_id] = time.time()
+        print(f"Player {player_id} disconnected from game {game_id}, grace period started")
+
+    def is_within_grace_period(self, game_id: str, player_id: str) -> bool:
+        """Check if a player is within the reconnection grace period"""
+        if game_id not in self.disconnection_times or player_id not in self.disconnection_times[game_id]:
+            return False
+        
+        disconnect_time = self.disconnection_times[game_id][player_id]
+        return (time.time() - disconnect_time) <= GameConfig.RECONNECTION_GRACE_PERIOD
+
+    def cleanup_expired_disconnections(self, game_id: str):
+        """Remove expired disconnection records"""
+        if game_id not in self.disconnection_times:
+            return
+        
+        current_time = time.time()
+        expired_players = []
+        
+        for player_id, disconnect_time in self.disconnection_times[game_id].items():
+            if (current_time - disconnect_time) > GameConfig.RECONNECTION_GRACE_PERIOD:
+                expired_players.append(player_id)
+        
+        for player_id in expired_players:
+            del self.disconnection_times[game_id][player_id]
+        
+        if not self.disconnection_times[game_id]:
+            del self.disconnection_times[game_id]
 
     async def send_personal_message(self, message: dict, game_id: str, player_id: str):
         """Send a message to a specific player"""
         if game_id in self.active_connections and player_id in self.active_connections[game_id]:
-            await self.active_connections[game_id][player_id].send_json(message)
+            try:
+                await self.active_connections[game_id][player_id].send_json(message)
+            except Exception as e:
+                print(f"Failed to send message to {player_id}: {e}")
+                # Connection might be stale, remove it
+                self.disconnect(game_id, player_id)
 
     async def broadcast(self, message: dict, game_id: str):
         """Broadcast a message to all players in a game"""
         if game_id in self.active_connections:
-            for websocket in self.active_connections[game_id].values():
-                await websocket.send_json(message)
+            disconnected_players = []
+            for player_id, websocket in self.active_connections[game_id].items():
+                try:
+                    await websocket.send_json(message)
+                except Exception as e:
+                    print(f"Failed to broadcast to {player_id}: {e}")
+                    disconnected_players.append(player_id)
+            
+            # Clean up failed connections
+            for player_id in disconnected_players:
+                self.disconnect(game_id, player_id)
 
 # Initialize the connection manager
 manager = ConnectionManager()
+validated_manager = ValidatedConnectionManager(manager)
 
 # Redis interaction helper
 class RedisHelper:
@@ -600,6 +660,12 @@ class MoveCalculator:
                                 p2_selection: Optional[str], fen: str) -> chess.Board:
         """Select the best board based on player selections and engine analysis"""
         if p1_selection and p2_selection:
+            # Check for unanimous move
+            unanimous_move = p1_selection == p2_selection
+            
+            if unanimous_move:
+                return chess.Board(p1_selection)
+            
             # Analyze both positions
             p1_board = chess.Board(p1_selection)
             p1_info = engine.analyse(p1_board, chess.engine.Limit(time=GameConfig.STOCKFISH_ANALYSIS_TIME))
@@ -680,6 +746,12 @@ class GameManager:
         """Set up initial player seats or assign a player to an open seat"""
         print(f"Player {player_id} joined game {game_id}")
 
+        # Check if player already has a seat (reconnection case)
+        existing_seat = GameManager.get_player_seat(game_id, player_id)
+        if existing_seat:
+            print(f"Player {player_id} already has seat {existing_seat} in game {game_id}")
+            return existing_seat
+
         t1p1_seat_key = RedisHelper.game_key(game_id, "t1p1_seat")
         
         if not redis.exists(t1p1_seat_key):
@@ -711,8 +783,24 @@ class GameManager:
             
             # Set all values at once
             RedisHelper.set_multiple(key_values)
+            return "t1p1"
+        else:
+            # Game already exists, try to find an empty seat
+            seats = GameManager.get_all_seats(game_id)
+            for seat in ["t1p1", "t1p2", "t2p1", "t2p2"]:
+                if not seats[seat]:
+                    # Found an empty seat, assign player to it
+                    RedisHelper.set_with_ttl(
+                        RedisHelper.game_key(game_id, f"{seat}_seat"), 
+                        player_id
+                    )
+                    print(f"Assigned player {player_id} to seat {seat} in existing game {game_id}")
+                    return seat
+            
+            print(f"No empty seats available for player {player_id} in game {game_id}")
+            return None
         
-        return
+        return None
     
     @staticmethod
     def get_player_seat(game_id: str, player_id: str) -> Optional[str]:
@@ -730,6 +818,95 @@ class GameManager:
         for seat in ["t1p1", "t1p2", "t2p1", "t2p2"]:
             seats[seat] = GameStateManager.get_game_state(game_id, f"{seat}_seat")
         return seats
+    
+    @staticmethod
+    async def attempt_seat_recovery(game_id: str, player_id: str) -> Optional[str]:
+        """
+        Attempt to recover a seat for a player who lost their assignment.
+        
+        This handles scenarios like:
+        - Race conditions during initial connection
+        - Redis TTL expiration
+        - Temporary disconnection/reconnection issues
+        
+        Strategy:
+        1. Check if player was recently in a seat (check disconnection history)
+        2. If only one seat available for the active team, auto-assign
+        3. Otherwise, assign to first available seat
+        """
+        print(f"🔧 Starting seat recovery for {player_id} in game {game_id}")
+        
+        # Get current game state
+        current_phase = GameStateManager.get_game_state(game_id, "game_phase")
+        seats = GameManager.get_all_seats(game_id)
+        
+        print(f"📊 Current phase: {current_phase}")
+        print(f"🪑 Current seats: {seats}")
+        
+        # Strategy 1: Check if this is during a selection phase and there's only one empty seat for the active team
+        if current_phase in [GamePhase.TEAM1_SELECTION, GamePhase.TEAM2_SELECTION]:
+            active_team = "t1" if current_phase == GamePhase.TEAM1_SELECTION else "t2"
+            team_seats = [f"{active_team}p1", f"{active_team}p2"]
+            empty_team_seats = [seat for seat in team_seats if not seats[seat]]
+            
+            if len(empty_team_seats) == 1:
+                # Only one seat available for active team - auto assign
+                auto_seat = empty_team_seats[0]
+                print(f"🎯 Auto-assigning {player_id} to {auto_seat} (only empty seat for active team)")
+                
+                RedisHelper.set_with_ttl(
+                    RedisHelper.game_key(game_id, f"{auto_seat}_seat"), 
+                    player_id
+                )
+                
+                # Broadcast seat update
+                await GameManager._broadcast_seat_update(game_id)
+                return auto_seat
+        
+        # Strategy 2: Check if there's exactly one empty seat in the game
+        empty_seats = [seat for seat, occupant in seats.items() if not occupant]
+        
+        if len(empty_seats) == 1:
+            auto_seat = empty_seats[0]
+            print(f"🎯 Auto-assigning {player_id} to {auto_seat} (only empty seat in game)")
+            
+            RedisHelper.set_with_ttl(
+                RedisHelper.game_key(game_id, f"{auto_seat}_seat"), 
+                player_id
+            )
+            
+            # Broadcast seat update
+            await GameManager._broadcast_seat_update(game_id)
+            return auto_seat
+        
+        # Strategy 3: Assign to first available seat (fallback)
+        for seat in ["t1p1", "t1p2", "t2p1", "t2p2"]:
+            if not seats[seat]:
+                print(f"🔄 Assigning {player_id} to first available seat: {seat}")
+                
+                RedisHelper.set_with_ttl(
+                    RedisHelper.game_key(game_id, f"{seat}_seat"), 
+                    player_id
+                )
+                
+                # Broadcast seat update
+                await GameManager._broadcast_seat_update(game_id)
+                return seat
+        
+        print(f"❌ No seats available for recovery for {player_id}")
+        return None
+    
+    @staticmethod
+    async def _broadcast_seat_update(game_id: str):
+        """Helper method to broadcast seat assignments to all players"""
+        seats = GameManager.get_all_seats(game_id)
+        formatted_seats = {seat: player_id or "" for seat, player_id in seats.items()}
+        
+        await validated_manager.broadcast_validated_message(
+            "player_seats",
+            game_id,
+            seats=formatted_seats
+        )
 
 # Player action handlers
 class PlayerActionHandler:
@@ -763,6 +940,24 @@ class PlayerActionHandler:
         # Find player's seat
         player_seat = GameManager.get_player_seat(game_id, player_id)
         
+        if not player_seat:
+            print(f"❌ Player {player_id} has no seat assigned for ready status!")
+            
+            # Try to recover seat
+            print(f"🔧 Attempting seat recovery for ready status: {player_id}...")
+            recovered_seat = await GameManager.attempt_seat_recovery(game_id, player_id)
+            
+            if recovered_seat:
+                print(f"✅ Successfully recovered seat {recovered_seat} for {player_id}")
+                player_seat = recovered_seat
+            else:
+                print(f"❌ Could not recover seat for {player_id}, ignoring ready status change")
+                await validated_manager.send_error(
+                    game_id, player_id, 
+                    "No seat assigned. Please refresh the page or take a seat."
+                )
+                return
+        
         if player_seat:
             # Set ready status
             RedisHelper.set_with_ttl(
@@ -794,20 +989,51 @@ class PlayerActionHandler:
     @staticmethod
     async def submit_move(game_id: str, player_id: str, move: str):
         """Submit a move for a player"""
+        print(f"🎯 Processing move submission: player={player_id}, move={move[:50]}...")
+        
         player_seat = GameManager.get_player_seat(game_id, player_id)
+        print(f"🪑 Player {player_id} seat: {player_seat}")
         
         if not player_seat:
-            return
+            print(f"❌ Player {player_id} has no seat assigned!")
+            
+            # Try to recover by auto-assigning to available seat if possible
+            print(f"🔧 Attempting seat recovery for {player_id}...")
+            recovered_seat = await GameManager.attempt_seat_recovery(game_id, player_id)
+            
+            if recovered_seat:
+                print(f"✅ Successfully recovered seat {recovered_seat} for {player_id}")
+                player_seat = recovered_seat
+            else:
+                print(f"❌ Could not recover seat for {player_id}, rejecting move")
+                # Send error message to client
+                await validated_manager.send_error(
+                    game_id, player_id, 
+                    "No seat assigned. Please refresh the page or take a seat."
+                )
+                return
         
         # Check if it's this player's team's turn
         current_phase = GameStateManager.get_game_state(game_id, "game_phase")
+        print(f"📊 Current game phase: {current_phase}")
+        
         is_team1 = player_seat.startswith("t1")
         is_team2 = player_seat.startswith("t2")
         
         can_move = (is_team1 and current_phase == GamePhase.TEAM1_SELECTION) or \
                    (is_team2 and current_phase == GamePhase.TEAM2_SELECTION)
         
+        print(f"🔄 Can move? {can_move} (is_team1={is_team1}, is_team2={is_team2})")
+        
         if can_move:
+            print(f"✅ Recording move for {player_seat}")
+            
+            # Auto-ready the player when they submit a move
+            current_ready_status = GameStateManager.get_game_state(game_id, f"{player_seat}_ready")
+            if current_ready_status != "true":
+                print(f"🟢 Auto-setting {player_id} to ready (was {current_ready_status})")
+                await PlayerActionHandler.set_ready_status(game_id, player_id, True)
+            
             # Record the player's move
             await GameStateManager.update_game_state(
                 game_id=game_id,
@@ -823,11 +1049,37 @@ class PlayerActionHandler:
                 },
                 game_id
             )
+            print(f"📤 Broadcasted move_submitted for {player_id}")
+        else:
+            print(f"❌ Move rejected: not player's turn (phase={current_phase}, seat={player_seat})")
+            # Send error message to client
+            await validated_manager.send_error(
+                game_id, player_id, 
+                f"Cannot submit move: wrong phase ({current_phase}) for your team"
+            )
     
     @staticmethod
     async def lock_in_move(game_id: str, player_id: str):
         """Lock in a player's move selection"""
         player_seat = GameManager.get_player_seat(game_id, player_id)
+        
+        if not player_seat:
+            print(f"❌ Player {player_id} has no seat assigned for lock-in!")
+            
+            # Try to recover seat
+            print(f"🔧 Attempting seat recovery for lock-in: {player_id}...")
+            recovered_seat = await GameManager.attempt_seat_recovery(game_id, player_id)
+            
+            if recovered_seat:
+                print(f"✅ Successfully recovered seat {recovered_seat} for {player_id}")
+                player_seat = recovered_seat
+            else:
+                print(f"❌ Could not recover seat for {player_id}, rejecting lock-in")
+                await validated_manager.send_error(
+                    game_id, player_id, 
+                    "No seat assigned. Please refresh the page or take a seat."
+                )
+                return
         
         if player_seat:
             await GameStateManager.update_game_state(
@@ -838,35 +1090,90 @@ class PlayerActionHandler:
     
     @staticmethod
     async def handle_disconnect(game_id: str, player_id: str):
-        """Handle player disconnection"""
-        # Find and clear player's seat
+        """Handle player disconnection with grace period for reconnection"""
+        player_seat = GameManager.get_player_seat(game_id, player_id)
+        
+        # Notify other players about the disconnection with validated message
+        await validated_manager.broadcast_validated_message(
+            "player_disconnected",
+            game_id,
+            player_id=player_id,
+            grace_period=GameConfig.RECONNECTION_GRACE_PERIOD
+        )
+        
+        # Schedule cleanup after grace period
+        asyncio.create_task(PlayerActionHandler._delayed_disconnect_cleanup(game_id, player_id))
+    
+    @staticmethod
+    async def _delayed_disconnect_cleanup(game_id: str, player_id: str):
+        """Clean up player state after grace period expires"""
+        # Wait for the grace period
+        await asyncio.sleep(GameConfig.RECONNECTION_GRACE_PERIOD)
+        
+        # Check if player has reconnected
+        if not manager.is_within_grace_period(game_id, player_id):
+            # Player hasn't reconnected, clean up their state
+            player_seat = GameManager.get_player_seat(game_id, player_id)
+            
+            if player_seat:
+                # Clear seat and ready status
+                RedisHelper.set_with_ttl(RedisHelper.game_key(game_id, f"{player_seat}_seat"), "")
+                RedisHelper.set_with_ttl(RedisHelper.game_key(game_id, f"{player_seat}_ready"), "false")
+                
+                # Clear any pending move selections
+                RedisHelper.delete(RedisHelper.game_key(game_id, f"{player_seat}_selection"))
+                RedisHelper.set_with_ttl(RedisHelper.game_key(game_id, f"{player_seat}_locked_in"), "false")
+            
+            # Clean up disconnection tracking
+            manager.cleanup_expired_disconnections(game_id)
+            
+            # Notify other players about permanent disconnection with validated message
+            await validated_manager.broadcast_validated_message(
+                "player_permanently_disconnected",
+                game_id,
+                player_id=player_id
+            )
+            
+            # Update seat info with validated message
+            seats = GameManager.get_all_seats(game_id)
+            formatted_seats = {seat: player_id for seat, player_id in seats.items()}
+            
+            await validated_manager.broadcast_validated_message(
+                "player_seats",
+                game_id,
+                seats=formatted_seats
+            )
+            
+            print(f"Player {player_id} permanently disconnected from game {game_id}")
+    
+    @staticmethod
+    async def handle_reconnection(game_id: str, player_id: str):
+        """Handle player reconnection within grace period"""
         player_seat = GameManager.get_player_seat(game_id, player_id)
         
         if player_seat:
-            # Clear seat and ready status
-            RedisHelper.set_with_ttl(RedisHelper.game_key(game_id, f"{player_seat}_seat"), "")
-            RedisHelper.set_with_ttl(RedisHelper.game_key(game_id, f"{player_seat}_ready"), "false")
+            # Notify other players about the reconnection with validated message
+            await validated_manager.broadcast_validated_message(
+                "player_reconnected",
+                game_id,
+                player_id=player_id,
+                seat=player_seat
+            )
+            
+            # Send current game state to the reconnected player with validated message
+            game_state = GameStateManager.get_all_game_state(game_id)
+            await validated_manager.send_validated_message(
+                "reconnection_state_sync",
+                game_id,
+                player_id,
+                game_state=game_state,
+                your_seat=player_seat
+            )
+            
+            print(f"Player {player_id} successfully reconnected to seat {player_seat} in game {game_id}")
+            return True
         
-        # Notify other players
-        await manager.broadcast(
-            {
-                "type": "player_disconnected", 
-                "player_id": player_id
-            },
-            game_id
-        )
-        
-        # Update seat info
-        seats = GameManager.get_all_seats(game_id)
-        formatted_seats = {seat: player_id for seat, player_id in seats.items()}
-        
-        await manager.broadcast(
-            {
-                "type": "player_seats",
-                "seats": formatted_seats
-            },
-            game_id
-        )
+        return False
 
 # WebSocket endpoint
 @app.websocket("/ws/game/{game_id}/player/{player_id}")
@@ -878,7 +1185,46 @@ async def websocket_endpoint(
 ):
     # Accept connection and set up player
     await manager.connect(websocket, game_id, player_id)
-    GameManager.initialize_player_seats(game_id, player_id)
+    
+    # Check if this is a reconnection within grace period
+    is_reconnection = manager.is_within_grace_period(game_id, player_id)
+    
+    assigned_seat = None
+    
+    if is_reconnection:
+        # Handle reconnection
+        reconnection_successful = await PlayerActionHandler.handle_reconnection(game_id, player_id)
+        if reconnection_successful:
+            # Send validated reconnection success message
+            await validated_manager.send_validated_message(
+                "reconnection_successful",
+                game_id, 
+                player_id,
+                message="Welcome back! Your game state has been restored."
+            )
+            assigned_seat = GameManager.get_player_seat(game_id, player_id)
+        else:
+            # Player was disconnected but no longer has a seat, treat as new player
+            assigned_seat = GameManager.initialize_player_seats(game_id, player_id)
+    else:
+        # New player connection
+        assigned_seat = GameManager.initialize_player_seats(game_id, player_id)
+    
+    # Verify seat assignment succeeded and attempt recovery if needed
+    if not assigned_seat:
+        print(f"⚠️ Initial seat assignment failed for {player_id}, attempting recovery...")
+        assigned_seat = await GameManager.attempt_seat_recovery(game_id, player_id)
+        
+        if not assigned_seat:
+            print(f"❌ Could not assign any seat to {player_id}")
+            await validated_manager.send_error(
+                game_id, player_id, 
+                "Game is full. No seats available."
+            )
+            await websocket.close()
+            return
+    
+    print(f"✅ Player {player_id} connected with seat: {assigned_seat}")
     
     game_exists = redis.exists(RedisHelper.game_key(game_id, "created_time"))
     if not game_exists:
@@ -891,14 +1237,12 @@ async def websocket_endpoint(
             str(time.time())
         )
     
-    # Send initial connection confirmation
-    await manager.send_personal_message(
-        {
-            "type": "connection_established",
-            "player_id": player_id
-        },
+    # Send initial connection confirmation with validation
+    await validated_manager.send_validated_message(
+        "connection_established",
         game_id, 
-        player_id
+        player_id,
+        is_reconnection=is_reconnection
     )
 
     # Send current game state
@@ -913,33 +1257,13 @@ async def websocket_endpoint(
             # Receive message from client
             data = await websocket.receive_json()
             
-            # Process the message based on its type
-            message_type = data.get("type", "")
+            # Process message with Pydantic validation
+            success = await process_validated_message(
+                data, game_id, player_id, validated_manager
+            )
             
-            if message_type == "submit_move":
-                await PlayerActionHandler.submit_move(
-                    game_id, data["player_id"], data["move"]
-                )
-            
-            elif message_type == "take_seat":
-                await PlayerActionHandler.change_seat(
-                    game_id, player_id, data["seat"]
-                )
-            
-            elif message_type == "ready":
-                await PlayerActionHandler.set_ready_status(
-                    game_id, player_id, True
-                )
-            
-            elif message_type == "not_ready":
-                await PlayerActionHandler.set_ready_status(
-                    game_id, player_id, False
-                )
-
-            elif message_type == "lock_in_move":
-                await PlayerActionHandler.lock_in_move(
-                    game_id, data["player_id"]
-                )
+            if not success:
+                print(f"Failed to process message from {player_id} in game {game_id}: {data}")
 
     except WebSocketDisconnect:
         # Handle disconnect
@@ -949,6 +1273,8 @@ async def websocket_endpoint(
     except Exception as e:
         # Log any unexpected errors
         print(f"Error in websocket handler for game {game_id}, player {player_id}: {e}")
+        # Send error to client
+        await validated_manager.send_error(game_id, player_id, f"Server error: {str(e)}")
         # Attempt to clean up connections and tasks
         manager.disconnect(game_id, player_id)
         background_task.cancel()
@@ -958,11 +1284,72 @@ async def game_state_checker(game_id: str):
     try:
         while True:
             await PhaseManager.check_and_handle_phase_transitions(game_id)
+            
+            # Clean up expired disconnections periodically
+            manager.cleanup_expired_disconnections(game_id)
+            
             await asyncio.sleep(0.5)  # Check every 0.5 seconds
     except asyncio.CancelledError:
         print(f"Game state checker for game {game_id} was cancelled")
     except Exception as e:
         print(f"Error in game state checker for game {game_id}: {e}")
+
+# Background task to clean up expired disconnections globally
+async def global_disconnection_cleanup():
+    """Periodically clean up expired disconnection records across all games"""
+    try:
+        while True:
+            await asyncio.sleep(60)  # Run every minute
+            
+            # Get all game IDs that have disconnection records
+            game_ids = list(manager.disconnection_times.keys())
+            
+            for game_id in game_ids:
+                manager.cleanup_expired_disconnections(game_id)
+                
+    except asyncio.CancelledError:
+        print("Global disconnection cleanup task was cancelled")
+    except Exception as e:
+        print(f"Error in global disconnection cleanup: {e}")
+
+# Start the global cleanup task when the server starts
+@app.on_event("startup")
+async def startup_event():
+    """Start background tasks when the server starts"""
+    asyncio.create_task(global_disconnection_cleanup())
+    print("Server started with enhanced reconnection support")
+
+@app.get("/api/games/{game_id}/reconnection/{player_id}")
+async def check_reconnection_status(game_id: str, player_id: str):
+    """Check if a player can reconnect to a game and get their status"""
+    try:
+        # Check if player is within grace period
+        within_grace_period = manager.is_within_grace_period(game_id, player_id)
+        
+        # Get player's seat if they have one
+        player_seat = GameManager.get_player_seat(game_id, player_id)
+        
+        # Get game phase
+        game_phase = GameStateManager.get_game_state(game_id, "game_phase")
+        
+        # Calculate remaining grace time
+        remaining_grace_time = 0
+        if within_grace_period and game_id in manager.disconnection_times and player_id in manager.disconnection_times[game_id]:
+            disconnect_time = manager.disconnection_times[game_id][player_id]
+            elapsed_time = time.time() - disconnect_time
+            remaining_grace_time = max(0, GameConfig.RECONNECTION_GRACE_PERIOD - elapsed_time)
+        
+        return JSONResponse(content={
+            "can_reconnect": within_grace_period and player_seat is not None,
+            "player_seat": player_seat,
+            "game_phase": game_phase,
+            "remaining_grace_time": round(remaining_grace_time, 1),
+            "grace_period_total": GameConfig.RECONNECTION_GRACE_PERIOD
+        })
+        
+    except Exception as e:
+        print(f"Error checking reconnection status for {player_id} in game {game_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/games/available")
 async def get_available_games():
